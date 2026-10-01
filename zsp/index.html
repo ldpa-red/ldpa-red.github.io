@@ -1,0 +1,152 @@
+# Installation d'Extraction ZSP en une ligne, depuis PowerShell (sans droits administrateur) :
+#   irm https://gist.githubusercontent.com/<compte>/<gist>/raw/installer-zsp.ps1 | iex
+# Le script demande le mot de passe d'installation, dechiffre le paquet zsp-secrets.txt du meme gist
+# (identifiant Google, fichier clients, cle de mise a jour), telecharge la derniere version publiee
+# sur le depot prive, verifie son empreinte, puis lance son installeur habituel.
+# Ce fichier ne contient aucun secret : il est publie tel quel par installation\Publier-Installeur-Web.ps1,
+# qui remplace 6c663070a4d4c7b4d4d809c4952ad29c et ldpa-red/extraction_zsp. Pas de "exit" : la fenetre PowerShell de l'utilisateur reste ouverte.
+& {
+$ErrorActionPreference = 'Stop'
+$gist = '6c663070a4d4c7b4d4d809c4952ad29c'
+$depot = 'ldpa-red/extraction_zsp'
+$api = 'https://api.github.com'
+# Essais uniquement (tests\Tester-ZSP.ps1) : faux GitHub local, mot de passe et options de l'installeur
+$essai = [bool]$env:ZSP_API_MAJ
+if ($essai) { $api = $env:ZSP_API_MAJ.TrimEnd('/') }
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+function Invoke-HttpZsp {
+    # Suit les redirections a la main : la cle n'est envoyee qu'a l'API, jamais au serveur de fichiers
+    param([string]$Url, [string]$Cle, [string]$Accept, [string]$Fichier = '')
+    $hoteApi = ([uri]$Url).Authority
+    for ($saut = 0; $saut -lt 5; $saut++) {
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.AllowAutoRedirect = $false
+        $req.UserAgent = 'ExtractionZSP'
+        $req.Accept = $Accept
+        $req.Timeout = 30000
+        $req.ReadWriteTimeout = 300000
+        if ($Cle -and ([uri]$Url).Authority -eq $hoteApi) { $req.Headers['Authorization'] = 'Bearer ' + $Cle }
+        try {
+            $rep = $req.GetResponse()
+        } catch [Net.WebException] {
+            $r = $_.Exception.Response
+            if (-not $r) { throw ('GitHub injoignable (' + $_.Exception.Message + ')') }
+            $code = [int]$r.StatusCode
+            $r.Close()
+            if ($code -eq 401) { throw 'cle de mise a jour refusee (expiree ou supprimee sur GitHub) : demandez un nouveau paquet' }
+            throw ('reponse HTTP ' + $code + ' pour ' + $Url)
+        }
+        try {
+            $code = [int]$rep.StatusCode
+            if ($code -ge 300 -and $code -lt 400) {
+                $Url = (New-Object Uri(([uri]$Url), [string]$rep.Headers['Location'])).AbsoluteUri
+                continue
+            }
+            $flux = $rep.GetResponseStream()
+            if ($Fichier) {
+                $sortie = [IO.File]::Create($Fichier)
+                try { $flux.CopyTo($sortie) } finally { $sortie.Close() }
+                return
+            }
+            $lecteur = New-Object IO.StreamReader($flux, [Text.Encoding]::UTF8)
+            try { return $lecteur.ReadToEnd() } finally { $lecteur.Close() }
+        } finally {
+            $rep.Close()
+        }
+    }
+    throw 'trop de redirections'
+}
+
+function Unprotect-PaquetZsp {
+    # "ZSP1:" + base64( sel 16 | iv 16 | hmac 32 | AES-256-CBC ) ; cles tirees du mot de passe (PBKDF2-SHA256)
+    # Renvoie @{ nom = octets } ou $null si le mot de passe est faux.
+    param([string]$Texte, [string]$MotDePasse)
+    $Texte = $Texte.Trim()
+    if (-not $Texte.StartsWith('ZSP1:')) { throw 'paquet chiffre illisible' }
+    $tout = [Convert]::FromBase64String($Texte.Substring(5))
+    $sel = $tout[0..15]; $iv = $tout[16..31]; $mac = $tout[32..63]
+    $chiffre = New-Object byte[] ($tout.Length - 64)
+    [Array]::Copy($tout, 64, $chiffre, 0, $chiffre.Length)
+    $derive = New-Object Security.Cryptography.Rfc2898DeriveBytes(([Text.Encoding]::UTF8.GetBytes($MotDePasse)), [byte[]]$sel, 300000, [Security.Cryptography.HashAlgorithmName]::SHA256)
+    $cles = $derive.GetBytes(64)
+    $hmac = [Security.Cryptography.HMACSHA256]::new([byte[]]$cles[32..63])
+    $attendu = $hmac.ComputeHash([byte[]]($sel + $iv + $chiffre))
+    $difference = 0
+    for ($i = 0; $i -lt 32; $i++) { $difference = $difference -bor ($attendu[$i] -bxor $mac[$i]) }
+    if ($difference -ne 0) { return $null }
+    $aes = [Security.Cryptography.Aes]::Create()
+    $aes.Key = [byte[]]$cles[0..31]
+    $aes.IV = [byte[]]$iv
+    $clair = $aes.CreateDecryptor().TransformFinalBlock($chiffre, 0, $chiffre.Length)
+    $paquet = [Text.Encoding]::UTF8.GetString($clair) | ConvertFrom-Json
+    $fichiers = @{}
+    foreach ($f in $paquet.fichiers) {
+        $nom = Split-Path -Leaf ([string]$f.nom)
+        if ($nom -notmatch '^(maj\.cle|client_secret[^\\/]*\.json|client[^\\/]*\.(xlsx|csv))$') { continue }
+        $fichiers[$nom] = [Convert]::FromBase64String([string]$f.contenu)
+    }
+    return $fichiers
+}
+
+$travail = ''
+try {
+    Write-Host ''
+    Write-Host '  Extraction ZSP - installation' -ForegroundColor Cyan
+    Write-Host '  Le programme sera installe pour vous seul, sans droits administrateur.'
+    Write-Host ''
+    $gistJson = Invoke-HttpZsp ($api + '/gists/' + $gist) '' 'application/vnd.github+json' | ConvertFrom-Json
+    $paquetTexte = [string]$gistJson.files.'zsp-secrets.txt'.content
+    if (-not $paquetTexte) { throw 'paquet d''installation introuvable' }
+
+    $fichiers = $null
+    for ($tentative = 1; $tentative -le 3 -and -not $fichiers; $tentative++) {
+        if ($essai -and $env:ZSP_ESSAI_MDP) {
+            $mdp = $env:ZSP_ESSAI_MDP
+        } else {
+            $saisie = Read-Host '  Mot de passe d''installation (rien ne s''affiche)' -AsSecureString
+            $mdp = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($saisie))
+        }
+        Write-Host '  Verification du mot de passe...'
+        $fichiers = Unprotect-PaquetZsp $paquetTexte $mdp
+        $mdp = $null
+        if (-not $fichiers) {
+            Write-Host '  Mot de passe incorrect.' -ForegroundColor Red
+            if ($essai) { break }
+        }
+    }
+    if (-not $fichiers) { throw 'mot de passe incorrect : rien n''a ete installe.' }
+    if (-not $fichiers.ContainsKey('maj.cle')) { throw 'paquet incomplet (cle de mise a jour absente)' }
+    $cle = [Text.Encoding]::ASCII.GetString($fichiers['maj.cle']).Trim()
+
+    Write-Host '  Recherche de la derniere version...'
+    $rel = Invoke-HttpZsp ($api + '/repos/' + $depot + '/releases/latest') $cle 'application/vnd.github+json' | ConvertFrom-Json
+    $zip = @($rel.assets | Where-Object { [string]$_.name -like '*.zip' }) | Select-Object -First 1
+    if (-not $zip) { throw 'la derniere version publiee ne contient pas de zip' }
+    $m = [regex]::Match([string]$rel.body, '<!--\s*sha256:([0-9a-fA-F]{64})\s*-->')
+    Write-Host ('  Telechargement de la version ' + (([string]$rel.tag_name) -replace '^v', '') + '...')
+    $travail = Join-Path (Get-Item -LiteralPath $env:TEMP).FullName ('ZSP-web-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $travail | Out-Null
+    $fichierZip = Join-Path $travail 'zsp.zip'
+    Invoke-HttpZsp ([string]$zip.url) $cle 'application/octet-stream' $fichierZip
+    if ($m.Success -and (Get-FileHash -LiteralPath $fichierZip -Algorithm SHA256).Hash -ne $m.Groups[1].Value.ToUpperInvariant()) {
+        throw 'le fichier telecharge est incomplet ou altere (empreinte differente)'
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($fichierZip, (Join-Path $travail 'zip'))
+    $installeur = @(Get-ChildItem -LiteralPath (Join-Path $travail 'zip') -Recurse -Filter 'Installer-ZSP.ps1' -File) | Select-Object -First 1
+    if (-not $installeur) { throw 'le zip ne contient pas l''installeur' }
+    # Identifiant Google, fichier clients, cle : a cote de l'installeur, qui les range comme pour le zip
+    foreach ($nom in $fichiers.Keys) { [IO.File]::WriteAllBytes((Join-Path $installeur.DirectoryName $nom), $fichiers[$nom]) }
+
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installeur.FullName)
+    if ($essai -and $env:ZSP_ESSAI_ARGS) { $arguments += @($env:ZSP_ESSAI_ARGS -split '\|') }
+    & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @arguments
+} catch {
+    Write-Host ''
+    Write-Host ('  ECHEC : ' + $_.Exception.Message) -ForegroundColor Red
+} finally {
+    # Le dossier de travail contient les fichiers dechiffres : toujours efface
+    if ($travail -and (Test-Path -LiteralPath $travail)) { Remove-Item -LiteralPath $travail -Recurse -Force -ErrorAction SilentlyContinue }
+}
+}
